@@ -54,7 +54,7 @@ This technical architecture supports a **€36B market opportunity** across 6 Eu
 | **Database** | PostgreSQL (primary), Redis (cache) | ACID compliance, JSON support, proven at scale |
 | **Multi-tenancy** | Shared database, row-level isolation | Cost efficiency, easier operations, adequate security |
 | **API Strategy** | GraphQL (client apps), REST (integrations) | Flexible queries, mobile efficiency, partner compatibility |
-| **Deployment** | Kubernetes (EKS) | Container orchestration, auto-scaling, zero-downtime deployments |
+| **Deployment** | AWS ECS Fargate | Serverless containers, auto-scaling, zero ops overhead, cost-effective |
 
 ---
 
@@ -181,7 +181,7 @@ This technical architecture supports a **€36B market opportunity** across 6 Eu
 ┌─────────────────────────────▼─────────────────────────────────┐
 │                   INFRASTRUCTURE LAYER                         │
 ├────────────────────────────────────────────────────────────────┤
-│  Kubernetes (EKS)  │  VPC  │  CloudWatch  │  Secrets Manager  │
+│  ECS Fargate  │  VPC  │  ALB  │  CloudWatch  │  Secrets Mgr   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -270,7 +270,7 @@ VPC (10.0.0.0/16)
 │   └── Bastion Hosts (locked down)
 │
 ├── Private Subnets - Application (10.0.16.0/20) - 3 AZs
-│   ├── EKS Worker Nodes
+│   ├── ECS Fargate Tasks (serverless containers)
 │   ├── Application Containers
 │   └── No direct internet access (via NAT)
 │
@@ -1503,60 +1503,415 @@ eventBus.on('property.updated', async (event) => {
 
 ## Deployment & DevOps
 
+### Container Orchestration: ECS Fargate
+
+**Decision:** AWS ECS (Elastic Container Service) with Fargate (serverless)
+
+**Rationale:**
+1. **Serverless Containers:** No cluster management, AWS manages infrastructure
+2. **Cost-Effective:** Pay only for vCPU/memory used, no idle costs (vs EKS $73/month for control plane)
+3. **Simple Operations:** No Kubernetes complexity, no worker node patching
+4. **Auto-Scaling:** Built-in, scales based on CPU/memory or custom metrics
+5. **AWS Integration:** Native integration with ALB, CloudWatch, Secrets Manager, IAM
+6. **Fast Deployment:** Faster to set up than EKS (minutes vs hours)
+7. **Perfect for Monolith:** Single container deployment, straightforward architecture
+
+**Why NOT Kubernetes/EKS:**
+- **Complexity:** Kubernetes has steep learning curve, overkill for monolith
+- **Cost:** EKS control plane = $73/month + worker nodes = $200-400/month minimum
+- **Operational Overhead:** Node upgrades, security patching, cluster management
+- **Team Size:** Need Kubernetes expertise, harder to hire for early-stage startup
+
+**ECS Fargate Architecture:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Internet / CloudFront                       │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+        ┌────────────────────────────────────┐
+        │  Application Load Balancer (ALB)    │
+        │  - Multi-AZ (3 availability zones)  │
+        │  - Health checks                    │
+        │  - SSL termination                  │
+        └────────────────┬───────────────────┘
+                         │
+        ┌────────────────┴────────────────┐
+        │                                  │
+        ▼                                  ▼
+┌──────────────┐                  ┌──────────────┐
+│ ECS Service  │                  │ ECS Service  │
+│ (Production) │                  │ (Staging)    │
+└──────┬───────┘                  └──────┬───────┘
+       │                                  │
+       │ Target: 4 tasks                 │ Target: 2 tasks
+       │ Min: 2, Max: 20                 │ Min: 1, Max: 4
+       │                                  │
+  ┌────┴─────┬──────┬──────┐       ┌────┴────┐
+  ▼          ▼      ▼      ▼        ▼         ▼
+┌──────┐  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+│ Task │  │ Task │ │ Task │ │ Task │ │ Task │ │ Task │
+│ AZ-1 │  │ AZ-2 │ │ AZ-3 │ │ AZ-1 │ │ AZ-1 │ │ AZ-2 │
+└──┬───┘  └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘
+   │         │        │        │        │        │
+   └─────────┴────────┴────────┴────────┴────────┘
+                      │
+        ┌─────────────┴──────────────┐
+        │                            │
+        ▼                            ▼
+  ┌────────────┐              ┌────────────┐
+  │ RDS        │              │ Redis      │
+  │ PostgreSQL │              │ ElastiCache│
+  └────────────┘              └────────────┘
+```
+
+**ECS Task Definition:**
+
+```json
+{
+  "family": "property-management-app",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "123456789.dkr.ecr.eu-central-1.amazonaws.com/app:latest",
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-central-1:123:secret:db-url"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/property-management",
+          "awslogs-region": "eu-central-1",
+          "awslogs-stream-prefix": "app"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3
+      }
+    }
+  ]
+}
+```
+
+**Auto-Scaling Configuration:**
+
+```yaml
+# Target Tracking Scaling Policy
+ScalingPolicy:
+  Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  Properties:
+    PolicyName: cpu-scaling-policy
+    PolicyType: TargetTrackingScaling
+    ScalingTargetId: !Ref ScalableTarget
+    TargetTrackingScalingPolicyConfiguration:
+      TargetValue: 70.0  # Target 70% CPU utilization
+      PredeclaredMetricSpecification:
+        PredeclaredMetricType: ECSServiceAverageCPUUtilization
+      ScaleInCooldown: 300   # 5 min before scale down
+      ScaleOutCooldown: 60   # 1 min before scale up
+
+# Also scale on memory
+MemoryScalingPolicy:
+  Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  Properties:
+    PolicyName: memory-scaling-policy
+    PolicyType: TargetTrackingScaling
+    TargetTrackingScalingPolicyConfiguration:
+      TargetValue: 80.0  # Target 80% memory utilization
+      PredeclaredMetricSpecification:
+        PredeclaredMetricType: ECSServiceAverageMemoryUtilization
+```
+
+**Resource Allocation by Environment:**
+
+| Environment | CPU | Memory | Tasks (Min/Target/Max) | Monthly Cost |
+|-------------|-----|--------|------------------------|--------------|
+| **Development** | 256 | 512 MB | 1/1/2 | ~$15 |
+| **Staging** | 512 | 1 GB | 1/2/4 | ~$45 |
+| **Production** | 1024 | 2 GB | 2/4/20 | ~$180 (avg load) |
+
 ### CI/CD Pipeline
 
-**Tools:** GitHub Actions (CI), ArgoCD (CD)
+**Tools:** GitHub Actions (CI/CD - no separate CD tool needed)
 
 **Pipeline Stages:**
 
 ```yaml
 # .github/workflows/deploy.yml
-name: Deploy Pipeline
+name: Deploy to ECS
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: property-management-app
+  ECS_SERVICE_PROD: app-production
+  ECS_SERVICE_STAGING: app-staging
+  ECS_CLUSTER: property-management-cluster
+  CONTAINER_NAME: app
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-      - run: npm ci
-      - run: npm run lint          # ESLint, Prettier
-      - run: npm run type-check    # TypeScript
-      - run: npm test              # Unit tests
-      - run: npm run test:e2e      # Playwright E2E tests
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Run unit tests
+        run: npm test -- --coverage
+
+      - name: Run E2E tests
+        run: npm run test:e2e
 
   security:
     runs-on: ubuntu-latest
     steps:
-      - run: npm audit             # Dependency vulnerabilities
-      - run: npx snyk test         # Snyk security scan
+      - uses: actions/checkout@v3
 
-  build:
+      - name: Run npm audit
+        run: npm audit --audit-level=high
+
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  build-and-push:
     needs: [test, security]
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
     steps:
-      - run: docker build -t app:${{ github.sha }} .
-      - run: docker push app:${{ github.sha }}
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          docker build \
+            --build-arg NODE_ENV=production \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+          # Push to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          # Output image URI
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
   deploy-staging:
-    needs: build
+    needs: build-and-push
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.propertysaas.de
+
     steps:
-      - run: kubectl set image deployment/app app=app:${{ github.sha }} -n staging
-      - run: kubectl rollout status deployment/app -n staging
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition app-staging \
+            --query taskDefinition > task-definition.json
+
+      - name: Fill in new image ID in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS Staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_STAGING }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Run smoke tests
+        run: |
+          # Wait for deployment
+          sleep 30
+          # Health check
+          curl -f https://staging.propertysaas.de/health || exit 1
 
   deploy-production:
-    needs: deploy-staging
+    needs: [build-and-push, deploy-staging]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://app.propertysaas.de
+
     steps:
-      # Manual approval required (GitHub Environment)
-      - run: kubectl set image deployment/app app=app:${{ github.sha }} -n production
-      - run: kubectl rollout status deployment/app -n production
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition app-production \
+            --query taskDefinition > task-definition.json
+
+      - name: Fill in new image ID in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS Production (Blue-Green)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_PROD }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          # ECS manages blue-green deployment automatically
+
+      - name: Verify deployment
+        run: |
+          # Wait for all tasks to be healthy
+          sleep 60
+          # Run production smoke tests
+          curl -f https://app.propertysaas.de/health || exit 1
+          curl -f https://app.propertysaas.de/api/health/db || exit 1
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          # Send Slack notification
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"✅ Production deployment successful: ${{ github.sha }}"}'
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          # ECS automatically keeps previous task definition
+          # Manual rollback: update service to previous task definition revision
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_PROD }} \
+            --task-definition app-production:PREVIOUS_REVISION \
+            --force-new-deployment
+```
+
+**Dockerfile (Optimized for Production):**
+
+```dockerfile
+# Multi-stage build for smaller image size
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy source
+COPY . .
+
+# Build TypeScript
+RUN npm run build
+
+# Production image
+FROM node:20-alpine
+
+# Security: Run as non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+WORKDIR /app
+
+# Copy built artifacts and dependencies
+COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/package*.json ./
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+# Switch to non-root user
+USER nodejs
+
+# Expose port
+EXPOSE 3000
+
+# Start application
+CMD ["node", "dist/server.js"]
 ```
 
 ### Deployment Strategy
@@ -1620,7 +1975,8 @@ terraform/
 ├── modules/
 │   ├── vpc/
 │   ├── rds/
-│   ├── eks/
+│   ├── ecs/                      # ECS cluster, services, tasks
+│   ├── alb/                      # Application Load Balancer
 │   └── s3/
 ├── environments/
 │   ├── staging/
@@ -1840,7 +2196,7 @@ No query timeout configured.
 |-------|-----------|-----------|
 | **Cloud** | AWS | EU data centers, mature services, compliance certifications |
 | **Container** | Docker | Industry standard, reproducible builds |
-| **Orchestration** | Kubernetes (EKS) | Auto-scaling, self-healing, zero-downtime deployments |
+| **Orchestration** | ECS Fargate | Serverless containers, no cluster management, cost-effective |
 | **Database** | PostgreSQL 15 | ACID, JSON support, full-text search, proven at scale |
 | **Cache** | Redis 7 | Fast, versatile (cache, sessions, pub/sub, rate limiting) |
 | **Object Storage** | S3 | Durable (99.999999999%), cheap, integrates with everything |
@@ -1996,23 +2352,31 @@ if (isFeatureEnabled('ocr-invoice-extraction', tenantId)) {
 
 | Service | Configuration | Monthly Cost |
 |---------|--------------|--------------|
-| **Compute (EKS)** | 6 nodes × t3.large | $600 |
+| **Compute (ECS Fargate)** | 4 tasks × 1vCPU/2GB (avg) | $180 |
+| **ECR (Container Registry)** | Image storage | $10 |
 | **Database (RDS)** | db.r6g.xlarge, Multi-AZ | $800 |
 | **Cache (Redis)** | cache.r6g.large | $200 |
 | **Storage (S3)** | 5TB documents | $115 |
 | **CDN (CloudFront)** | 10TB transfer | $850 |
 | **Load Balancer** | Application LB | $30 |
-| **Monitoring** | CloudWatch + Datadog | $300 |
+| **Monitoring** | CloudWatch (no Datadog yet) | $150 |
 | **Backups** | Snapshots, cross-region | $100 |
-| **Other** | Secrets Manager, KMS, etc. | $100 |
+| **Other** | Secrets Manager, KMS, etc. | $80 |
 | **Third-Party SaaS** | Stripe, SendGrid, Lokalise, etc. | $500 |
-| **TOTAL** | | **$3,595/month** |
+| **TOTAL** | | **$3,015/month** |
 
-**Per-Customer Cost:** $3.60/month
+**Per-Customer Cost:** $3.02/month
 
 **Revenue (assuming €149 ARPU):** €149,000/month = ~$160,000/month
 
 **Gross Margin:** ~98% (typical SaaS)
+
+**Cost Savings vs Kubernetes:**
+- **ECS Fargate vs EKS**: $180/month vs $673/month ($73 control plane + $600 nodes) = **$493/month savings (73% reduction)**
+- **Simpler Monitoring**: CloudWatch only initially (add Datadog Month 12+) = $150/month savings
+- **No Kubernetes Tools**: No ArgoCD, Helm, etc. needed
+
+**Total Monthly Savings:** **~$580/month** (~16% total cost reduction)
 
 ### Cost Optimization Strategies
 
@@ -2147,7 +2511,7 @@ if (isFeatureEnabled('ocr-invoice-extraction', tenantId)) {
 5. **React + React Native:** Code sharing, hiring pool, mature ecosystem
 6. **Multi-Tenant Shared DB:** Cost-efficient, proven at scale
 7. **GraphQL + REST:** Mobile efficiency + partner compatibility
-8. **Kubernetes (EKS):** Auto-scaling, zero-downtime deployments
+8. **ECS Fargate:** Serverless containers, simple ops, cost-effective ($580/month savings vs EKS)
 9. **Country-First Localization:** Competitive moat, not afterthought
 10. **Security by Design:** GDPR, SOC 2, encryption, audit logs
 
